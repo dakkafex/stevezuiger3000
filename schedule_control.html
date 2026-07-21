@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ESP32 Switch Scheduler</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f1115">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --accent: #5b8cff;
+    --text: #e7e9ee;
+    --muted: #8a90a2;
+    --border: #262b36;
+    --danger: #ff5b6e;
+    --ok: #3ddc97;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 640px; margin-inline: auto;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; margin-bottom: 16px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 10px 16px; font-size: 0.9rem; cursor: pointer;
+  }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); display: inline-block; margin-right: 6px; }
+  .status-dot.connected { background: var(--ok); }
+  .entry {
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 10px;
+  }
+  .days { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .day-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; padding: 6px 10px; font-size: 0.8rem;
+  }
+  .day-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  label { font-size: 0.8rem; color: var(--muted); display: block; margin-bottom: 4px; }
+  input[type="time"], input[type="number"] {
+    background: #0d0f14; border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px; width: 100%; font-size: 0.9rem;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .muted { color: var(--muted); font-size: 0.8rem; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--border); padding: 10px 18px;
+    border-radius: 8px; font-size: 0.85rem; display: none;
+  }
+</style>
+</head>
+<body>
+
+<h1>ESP32 Switch Scheduler</h1>
+<div class="subtitle">Connects directly over Bluetooth — no WiFi, no hotspot needed.</div>
+
+<div class="panel row">
+  <div><span id="statusDot" class="status-dot"></span><span id="statusText">Not connected</span></div>
+  <div>
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <div>
+      <div>Manual switch</div>
+      <div class="muted" id="relayStateText">Unknown</div>
+    </div>
+  </div>
+  <div class="grid" style="margin-top:10px;">
+    <div>
+      <label>Run for (minutes)</label>
+      <input type="number" id="runMinutes" min="1" value="20">
+    </div>
+    <div style="display:flex; align-items:flex-end; gap:8px;">
+      <button id="onBtn" disabled style="flex:1;">Turn ON</button>
+      <button id="offBtn" class="secondary" disabled style="flex:1;">Turn OFF</button>
+    </div>
+  </div>
+  <div class="muted" id="autoOffText" style="margin-top:8px;">Safety cutoff: --</div>
+  <div class="row" style="margin-top:10px;">
+    <div class="muted">Momentary test pulse (5s)</div>
+    <button id="triggerBtn" class="secondary" disabled>Trigger now</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <div>
+      <div>Device time</div>
+      <div class="muted" id="deviceTimeText">unknown</div>
+    </div>
+    <button id="syncTimeBtn" disabled>Sync time now</button>
+  </div>
+  <div class="row" style="margin-top:10px;">
+    <div class="muted" id="nextEventText">Next event: --</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <h3 style="margin:0;">Schedule</h3>
+    <button id="addEntryBtn" class="secondary" disabled>+ Add entry</button>
+  </div>
+  <div id="entriesContainer" style="margin-top:12px;"></div>
+  <button id="saveBtn" disabled style="width:100%; margin-top:8px;">Save schedule to device</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const SERVICE_UUID   = "12345678-1234-1234-1234-123456789abc";
+const SCHEDULE_UUID  = "12345678-1234-1234-1234-123456789ab1";
+const TIME_UUID      = "12345678-1234-1234-1234-123456789ab2";
+const STATUS_UUID    = "12345678-1234-1234-1234-123456789ab3";
+const COMMAND_UUID   = "12345678-1234-1234-1234-123456789ab4";
+
+const DAY_LABELS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+
+let device, server, scheduleChar, timeChar, statusChar, commandChar;
+let entries = []; // { id, days:[], hour, minute, duration, enabled }
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 2500);
+}
+
+function setConnectedUI(connected) {
+  document.getElementById('statusDot').classList.toggle('connected', connected);
+  document.getElementById('statusText').textContent = connected ? 'Connected' : 'Not connected';
+  document.getElementById('connectBtn').disabled = connected;
+  document.getElementById('disconnectBtn').disabled = !connected;
+  document.getElementById('syncTimeBtn').disabled = !connected;
+  document.getElementById('triggerBtn').disabled = !connected;
+  document.getElementById('onBtn').disabled = !connected;
+  document.getElementById('offBtn').disabled = !connected;
+  document.getElementById('addEntryBtn').disabled = !connected;
+  document.getElementById('saveBtn').disabled = !connected;
+}
+
+// Build a "fake UTC" epoch so that the ESP32's gmtime() shows your
+// intended LOCAL wall-clock day/hour/minute. This avoids needing any
+// timezone database on the microcontroller.
+function localWallClockAsEpoch() {
+  const now = new Date();
+  const localMillis = now.getTime() - now.getTimezoneOffset() * 60000;
+  return Math.floor(localMillis / 1000);
+}
+
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    scheduleChar = await service.getCharacteristic(SCHEDULE_UUID);
+    timeChar = await service.getCharacteristic(TIME_UUID);
+    statusChar = await service.getCharacteristic(STATUS_UUID);
+    commandChar = await service.getCharacteristic(COMMAND_UUID);
+
+    await statusChar.startNotifications();
+    statusChar.addEventListener('characteristicvaluechanged', onStatusUpdate);
+
+    setConnectedUI(true);
+    await loadScheduleFromDevice();
+    toast('Connected');
+  } catch (err) {
+    console.error(err);
+    toast('Connection failed: ' + err.message);
+  }
+}
+
+function onDisconnected() {
+  setConnectedUI(false);
+  toast('Disconnected');
+}
+
+async function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+function decodeText(dataView) {
+  return new TextDecoder().decode(dataView);
+}
+
+async function loadScheduleFromDevice() {
+  const value = await scheduleChar.readValue();
+  const json = decodeText(value);
+  try {
+    entries = JSON.parse(json);
+    if (!Array.isArray(entries)) entries = [];
+  } catch { entries = []; }
+  renderEntries();
+}
+
+function onStatusUpdate(event) {
+  const json = decodeText(event.target.value);
+  try {
+    const status = JSON.parse(json);
+    if (status.synced) {
+      const d = new Date(status.currentEpoch * 1000);
+      document.getElementById('deviceTimeText').textContent =
+        'Device thinks it is: ' + d.toUTCString().replace(' GMT', '');
+    } else {
+      document.getElementById('deviceTimeText').textContent = 'Not synced - tap "Sync time now"';
+    }
+    if (status.nextEventEpoch && status.nextEventEpoch > 0) {
+      const nd = new Date(status.nextEventEpoch * 1000);
+      document.getElementById('nextEventText').textContent =
+        'Next event: ' + nd.toUTCString().replace(' GMT', '');
+    } else {
+      document.getElementById('nextEventText').textContent = 'Next event: none scheduled';
+    }
+    if (typeof status.relayOn === 'boolean') {
+      document.getElementById('relayStateText').textContent = status.relayOn ? 'ON' : 'OFF';
+    }
+    if (status.relayOn && status.manualOffDeadline && status.manualOffDeadline > 0) {
+      const offDate = new Date(status.manualOffDeadline * 1000);
+      document.getElementById('autoOffText').textContent =
+        'Safety cutoff: auto-OFF at ' + offDate.toUTCString().replace(' GMT', '');
+    } else {
+      document.getElementById('autoOffText').textContent = 'Safety cutoff: --';
+    }
+  } catch (e) { /* ignore malformed status */ }
+}
+
+async function syncTime() {
+  const epoch = localWallClockAsEpoch();
+  const enc = new TextEncoder().encode(String(epoch));
+  await timeChar.writeValue(enc);
+  toast('Time synced');
+}
+
+async function triggerNow() {
+  const enc = new TextEncoder().encode('TRIGGER');
+  await commandChar.writeValue(enc);
+  toast('Triggered');
+}
+
+async function turnOn() {
+  const minutes = parseInt(document.getElementById('runMinutes').value, 10) || 20;
+  const seconds = minutes * 60;
+  const enc = new TextEncoder().encode('ON:' + seconds);
+  await commandChar.writeValue(enc);
+  document.getElementById('relayStateText').textContent = 'ON';
+  toast('Switch turned ON for ' + minutes + ' min (max, firmware-enforced)');
+}
+
+async function turnOff() {
+  const enc = new TextEncoder().encode('OFF');
+  await commandChar.writeValue(enc);
+  document.getElementById('relayStateText').textContent = 'OFF';
+  toast('Switch turned OFF');
+}
+
+async function saveSchedule() {
+  const json = JSON.stringify(entries);
+  if (json.length > 4000) {
+    toast('Schedule too large - remove some entries');
+    return;
+  }
+  const enc = new TextEncoder().encode(json);
+  await scheduleChar.writeValue(enc);
+  toast('Schedule saved to device');
+}
+
+function addEntry() {
+  entries.push({
+    id: Date.now(),
+    days: [1,2,3,4,5], // Mon-Fri default
+    hour: 7,
+    minute: 30,
+    duration: 300,
+    enabled: true
+  });
+  renderEntries();
+}
+
+function removeEntry(id) {
+  entries = entries.filter(e => e.id !== id);
+  renderEntries();
+}
+
+function toggleDay(entry, dayIndex) {
+  const idx = entry.days.indexOf(dayIndex);
+  if (idx >= 0) entry.days.splice(idx, 1);
+  else entry.days.push(dayIndex);
+  renderEntries();
+}
+
+function renderEntries() {
+  const container = document.getElementById('entriesContainer');
+  container.innerHTML = '';
+
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="muted">No schedule entries yet. Tap "+ Add entry".</div>';
+    return;
+  }
+
+  entries.forEach(entry => {
+    const div = document.createElement('div');
+    div.className = 'entry';
+
+    const timeStr = String(entry.hour).padStart(2,'0') + ':' + String(entry.minute).padStart(2,'0');
+
+    div.innerHTML = `
+      <div class="row">
+        <label style="margin:0;">
+          <input type="checkbox" ${entry.enabled ? 'checked' : ''} data-role="enabled"> Enabled
+        </label>
+        <button class="danger" data-role="remove" style="padding:4px 10px;">Remove</button>
+      </div>
+      <div class="days" data-role="days"></div>
+      <div class="grid">
+        <div>
+          <label>Time</label>
+          <input type="time" value="${timeStr}" data-role="time">
+        </div>
+        <div>
+          <label>Duration (seconds)</label>
+          <input type="number" min="1" value="${entry.duration}" data-role="duration">
+        </div>
+      </div>
+    `;
+
+    const daysContainer = div.querySelector('[data-role="days"]');
+    DAY_LABELS.forEach((label, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'day-btn' + (entry.days.includes(i) ? ' active' : '');
+      btn.textContent = label;
+      btn.onclick = () => toggleDay(entry, i);
+      daysContainer.appendChild(btn);
+    });
+
+    div.querySelector('[data-role="enabled"]').onchange = (e) => {
+      entry.enabled = e.target.checked;
+    };
+    div.querySelector('[data-role="remove"]').onclick = () => removeEntry(entry.id);
+    div.querySelector('[data-role="time"]').onchange = (e) => {
+      const [h, m] = e.target.value.split(':').map(Number);
+      entry.hour = h; entry.minute = m;
+    };
+    div.querySelector('[data-role="duration"]').onchange = (e) => {
+      entry.duration = parseInt(e.target.value, 10) || 1;
+    };
+
+    container.appendChild(div);
+  });
+}
+
+document.getElementById('connectBtn').onclick = connect;
+document.getElementById('disconnectBtn').onclick = disconnect;
+document.getElementById('syncTimeBtn').onclick = syncTime;
+document.getElementById('triggerBtn').onclick = triggerNow;
+document.getElementById('onBtn').onclick = turnOn;
+document.getElementById('offBtn').onclick = turnOff;
+document.getElementById('addEntryBtn').onclick = addEntry;
+document.getElementById('saveBtn').onclick = saveSchedule;
+
+renderEntries();
+
+if (!navigator.bluetooth) {
+  document.getElementById('statusText').textContent = 'Web Bluetooth not supported in this browser (use Chrome/Edge on desktop or Android)';
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>
