@@ -93,6 +93,11 @@ bool rtcAvailable = false; // true if the DS3231 was found on the I2C bus at boo
 
 bool bleActivityHappened = false; // set true on any write, so we know to recompute + maybe extend window
 
+// Plain RAM (not RTC_DATA_ATTR) - deliberately does NOT survive a reboot or
+// a deep-sleep cycle, so the device always defaults back to power-saving
+// mode on its own. Set via the "KEEPAWAKE:ON"/"KEEPAWAKE:OFF" commands.
+bool keepAwake = false;
+
 // ---------------- Time helpers ----------------
 // Time now comes from the DS3231 rather than RTC memory, so it is valid
 // immediately after ANY boot (power-on, reset, or deep sleep wake) as
@@ -395,6 +400,12 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
         DBG("[RELAY] No valid clock - refusing untimed ON, falling back to 5s pulse\n");
         firePulse(5);
       }
+    } else if (s == "KEEPAWAKE:ON") {
+      DBG("[MAIN] Keep-awake enabled\n");
+      keepAwake = true;
+    } else if (s == "KEEPAWAKE:OFF") {
+      DBG("[MAIN] Keep-awake disabled\n");
+      keepAwake = false;
     }
     bleActivityHappened = true;
   }
@@ -409,6 +420,7 @@ void publishStatus() {
   doc["currentEpoch"] = (long)now;
   doc["relayOn"] = relayManualOn;
   doc["manualOffDeadline"] = (long)manualOffDeadline;
+  doc["keepAwake"] = keepAwake;
 
   String schedJson = loadScheduleJson();
   DynamicJsonDocument schedDoc(MAX_SCHEDULE_JSON_LEN + 256);
@@ -552,20 +564,57 @@ void planNextSleepAndGo() {
   goToSleepUntil(bestTime, bestReason);
 }
 
+int clampScheduledDuration(JsonVariant entry) {
+  int duration = 5;
+  if (!entry.isNull() && entry.containsKey("duration")) {
+    duration = entry["duration"].as<int>();
+  }
+  if (duration < 1) duration = 1;
+  if (duration > (int)MAX_SCHEDULED_PULSE_SECONDS) duration = (int)MAX_SCHEDULED_PULSE_SECONDS;
+  return duration;
+}
+
 void runAdvertiseWindow() {
   DBG("[MAIN] Opening advertise window (%d sec, extendable)\n", ADVERTISE_WINDOW_SEC);
   startBLE();
   unsigned long start = millis();
   bleActivityHappened = false;
+  time_t lastFiredEventEpoch = 0;
 
-  while (millis() - start < (ADVERTISE_WINDOW_SEC * 1000UL)) {
+  while (keepAwake || (millis() - start < (ADVERTISE_WINDOW_SEC * 1000UL))) {
     int connCount = pServer ? pServer->getConnectedCount() : -1;
-    DBG("[MAIN] Window tick: t=%lus connected=%d\n", (millis() - start) / 1000, connCount);
+    DBG("[MAIN] Window tick: t=%lus connected=%d keepAwake=%d\n", (millis() - start) / 1000, connCount, (int)keepAwake);
+
+    // If asked to stay awake but nobody's actually connected anymore, fall
+    // back to normal power-saving behavior instead of advertising forever.
+    if (keepAwake && connCount == 0) {
+      DBG("[MAIN] Keep-awake requested but no connection - falling back to power-saving\n");
+      keepAwake = false;
+    }
+
     publishStatus();
+
+    // While we're staying awake past the normal window, the device won't
+    // be doing its usual sleep/wake-for-event cycle, so honor the schedule
+    // ourselves here instead - fire any due entry inline.
+    if (isTimeValid()) {
+      time_t now = getCurrentEpoch();
+      String schedJson = loadScheduleJson();
+      DynamicJsonDocument doc(MAX_SCHEDULE_JSON_LEN + 256);
+      JsonVariant entry;
+      time_t nextEvent = computeNextEvent(schedJson, now - 2, &entry, &doc);
+      if (nextEvent != 0 && nextEvent <= now && nextEvent > lastFiredEventEpoch) {
+        int duration = clampScheduledDuration(entry);
+        DBG("[MAIN] Firing due scheduled event inline (awake), duration=%d sec\n", duration);
+        lastFiredEventEpoch = nextEvent;
+        firePulse(duration);
+      }
+    }
+
     delay(2000);
     // Extend the window a bit if something just got written, so the
     // person has time to see confirmation / do a follow-up write.
-    if (bleActivityHappened && (millis() - start) > (ADVERTISE_WINDOW_SEC * 1000UL - 5000UL)) {
+    if (bleActivityHappened && !keepAwake && (millis() - start) > (ADVERTISE_WINDOW_SEC * 1000UL - 5000UL)) {
       start = millis() - (ADVERTISE_WINDOW_SEC * 1000UL) + 10000UL; // extend ~10s
       bleActivityHappened = false;
       DBG("[MAIN] Window extended due to recent activity\n");
@@ -582,12 +631,7 @@ void handleScheduledEvent() {
   JsonVariant entry;
   time_t eventTime = computeNextEvent(schedJson, now - 5, &entry, &doc); // small tolerance
 
-  int duration = 5;
-  if (!entry.isNull() && entry.containsKey("duration")) {
-    duration = entry["duration"].as<int>();
-  }
-  if (duration < 1) duration = 1;
-  if (duration > (int)MAX_SCHEDULED_PULSE_SECONDS) duration = (int)MAX_SCHEDULED_PULSE_SECONDS;
+  int duration = clampScheduledDuration(entry);
   DBG("[EVENT] Scheduled event firing, duration=%d sec (sleeping through it)\n", duration);
 
   // Unlike firePulse() (used for interactive TRIGGER/manual-ON-fallback,

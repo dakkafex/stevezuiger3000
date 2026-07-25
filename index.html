@@ -82,6 +82,21 @@
 <div class="panel">
   <div class="row">
     <div>
+      <div>Keep connected</div>
+      <div class="muted" id="keepAwakeText">Off - device sleeps between brief connect windows</div>
+    </div>
+    <button id="keepAwakeBtn" class="secondary" disabled>Keep connected</button>
+  </div>
+</div>
+
+<div class="panel">
+  <button id="stopBtn" class="danger" disabled style="width:100%; font-size:1.05rem; padding:14px;">STOP</button>
+  <div class="muted" style="margin-top:8px;">Cuts power immediately. Only works while connected - can't interrupt an unattended scheduled run the device is asleep through (max 3 min anyway). Use "Keep connected" if you need Stop always reachable.</div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <div>
       <div>Manual switch</div>
       <div class="muted" id="relayStateText">Unknown</div>
     </div>
@@ -172,6 +187,16 @@ function setConnectedUI(connected) {
   document.getElementById('offBtn').disabled = !connected;
   document.getElementById('addEntryBtn').disabled = !connected;
   document.getElementById('saveBtn').disabled = !connected;
+  document.getElementById('stopBtn').disabled = !connected;
+  document.getElementById('keepAwakeBtn').disabled = !connected;
+  if (!connected) setKeepAwakeUI(false);
+}
+
+function setKeepAwakeUI(on) {
+  document.getElementById('keepAwakeBtn').textContent = on ? 'Stop keeping connected' : 'Keep connected';
+  document.getElementById('keepAwakeText').textContent = on
+    ? 'On - device stays connected until you turn this off'
+    : 'Off - device sleeps between brief connect windows';
 }
 
 // Build a "fake UTC" epoch so that the ESP32's gmtime() shows your
@@ -210,6 +235,7 @@ async function connect() {
 }
 
 function onDisconnected() {
+  keepAwakeOn = false;
   setConnectedUI(false);
   toast('Disconnected');
 }
@@ -260,6 +286,10 @@ function onStatusUpdate(event) {
     } else {
       document.getElementById('autoOffText').textContent = 'Safety cutoff: --';
     }
+    if (typeof status.keepAwake === 'boolean') {
+      keepAwakeOn = status.keepAwake;
+      setKeepAwakeUI(keepAwakeOn);
+    }
   } catch (e) { /* ignore malformed status */ }
 }
 
@@ -295,6 +325,33 @@ async function turnOff() {
   await commandChar.writeValue(enc);
   document.getElementById('relayStateText').textContent = 'OFF';
   toast('Switch turned OFF');
+}
+
+async function stopPump() {
+  try {
+    const enc = new TextEncoder().encode('OFF');
+    await commandChar.writeValue(enc);
+    document.getElementById('relayStateText').textContent = 'OFF';
+    toast('Stopped');
+  } catch (err) {
+    console.error(err);
+    toast('Stop failed: ' + err.message);
+  }
+}
+
+let keepAwakeOn = false;
+async function toggleKeepAwake() {
+  const turningOn = !keepAwakeOn;
+  const enc = new TextEncoder().encode(turningOn ? 'KEEPAWAKE:ON' : 'KEEPAWAKE:OFF');
+  try {
+    await commandChar.writeValue(enc);
+    keepAwakeOn = turningOn;
+    setKeepAwakeUI(keepAwakeOn);
+    toast(keepAwakeOn ? 'Keeping connection alive' : 'Back to normal power-saving');
+  } catch (err) {
+    console.error(err);
+    toast('Failed: ' + err.message);
+  }
 }
 
 async function saveSchedule() {
@@ -384,6 +441,8 @@ document.getElementById('syncTimeBtn').onclick = syncTime;
 document.getElementById('triggerBtn').onclick = triggerNow;
 document.getElementById('onBtn').onclick = turnOn;
 document.getElementById('offBtn').onclick = turnOff;
+document.getElementById('stopBtn').onclick = stopPump;
+document.getElementById('keepAwakeBtn').onclick = toggleKeepAwake;
 document.getElementById('addEntryBtn').onclick = addEntry;
 document.getElementById('saveBtn').onclick = saveSchedule;
 
