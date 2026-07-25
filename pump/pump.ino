@@ -4,8 +4,9 @@
   Replaces a WiFi-AP + webserver switch/timer with a low-power BLE setup.
 
   - Advertises over BLE periodically (no WiFi AP, no webserver).
-  - You set a weekly schedule (day-of-week + time + duration) from the
-    matching schedule_control.html page using Web Bluetooth.
+  - You set a schedule using standard 5-field cron strings (minute hour
+    dom month dow) + duration from the matching index.html page using
+    Web Bluetooth.
   - Also supports manual ON/OFF (with an optional requested runtime) and
     a momentary test trigger, independent of the schedule. Manual ON/OFF
     state survives deep sleep via GPIO hold.
@@ -29,7 +30,7 @@
     - DS3231 RTC module wired over I2C: SDA -> I2C_SDA_PIN, SCL -> I2C_SCL_PIN,
       plus VCC/GND. Keep its coin cell installed.
 
-  BOARD: ESP32C3 Dev Module (or your specific C3 board)
+  BOARD: ESP32-S3 Dev Module (or your specific S3 board)
 */
 
 #include <NimBLEDevice.h>
@@ -47,12 +48,15 @@
 #define RELAY_PIN            38       // GPIO driving your switch/pump MOSFET gate (safe general-purpose pin, no flash/PSRAM conflict)
 #define RELAY_ACTIVE_HIGH     true     // set false if your relay is active-low
 #define ADVERTISE_WINDOW_SEC  120       // how long BLE stays advertising when it wakes to let you connect
-#define ADVERTISE_INTERVAL_SEC (4UL * 3600UL) // periodic "connect window" even with no scheduled event (4h)
+#define ADVERTISE_INTERVAL_DAY_SEC   (1UL * 3600UL) // periodic "connect window" during the day (1h)
+#define ADVERTISE_INTERVAL_NIGHT_SEC (4UL * 3600UL) // periodic "connect window" at night (4h) - less activity expected
+#define DAY_START_HOUR 7 // local hour (0-23) the "day" interval starts; before this, "night" interval applies
 #define MAX_SCHEDULE_JSON_LEN 4000      // max stored schedule string length
 #define I2C_SDA_PIN           8        // DS3231 SDA - adjust to your wiring
 #define I2C_SCL_PIN           9        // DS3231 SCL - adjust to your wiring
-#define MAX_MANUAL_ON_SECONDS (20UL * 60UL) // HARD safety ceiling: manual ON auto-shuts-off after this long, no matter what
-#define DEBUG_SERIAL          true      // set false once things are working, to save a little power/time
+#define MAX_MANUAL_ON_SECONDS (3UL * 60UL) // HARD safety ceiling: manual ON auto-shuts-off after this long, no matter what
+#define MAX_SCHEDULED_PULSE_SECONDS (3UL * 60UL) // HARD safety ceiling: a scheduled cron entry's duration is clamped to this too
+#define DEBUG_SERIAL          false     // set true temporarily to debug over serial
 #define DEBUG_BAUD            115200
 
 #if DEBUG_SERIAL
@@ -75,7 +79,7 @@ RTC_DATA_ATTR uint8_t  rtcWakeReason = 0;    // 0=boot/unknown, 1=event, 2=adver
 RTC_DATA_ATTR bool     relayManualOn = false; // persists manual ON/OFF across deep sleep
 RTC_DATA_ATTR time_t   manualOffDeadline = 0; // epoch when manual ON must auto-shut-off; 0 = no deadline active
 
-enum WakeReason { WAKE_UNKNOWN = 0, WAKE_EVENT = 1, WAKE_ADVERTISE = 2, WAKE_AUTO_OFF = 3 };
+enum WakeReason { WAKE_UNKNOWN = 0, WAKE_EVENT = 1, WAKE_ADVERTISE = 2, WAKE_AUTO_OFF = 3, WAKE_PULSE_END = 4 };
 
 Preferences prefs;
 NimBLEServer* pServer = nullptr;
@@ -93,9 +97,39 @@ bool bleActivityHappened = false; // set true on any write, so we know to recomp
 // Time now comes from the DS3231 rather than RTC memory, so it is valid
 // immediately after ANY boot (power-on, reset, or deep sleep wake) as
 // long as the module has been set at least once and its battery is good.
+// Some DS3231 boards (especially reused/cheap ones) report lostPower()==false
+// - i.e. the oscillator never stopped - even though this firmware has never
+// actually written a real time into them, leaving a stale/garbage value that
+// looks "valid" (often displaying as ~1970 once read as a Unix epoch). We
+// don't trust the DS3231's own lostPower() flag alone; we also require that
+// THIS firmware has successfully synced it at least once, tracked in NVS.
+// Cached in RAM after first read so isTimeValid() (called frequently, e.g.
+// every 2s during an advertise window) doesn't hit NVS every time.
+bool everSyncedCache = false;
+bool everSyncedCacheLoaded = false;
+
+bool everSyncedFlag() {
+  if (!everSyncedCacheLoaded) {
+    prefs.begin("time", true);
+    everSyncedCache = prefs.getBool("synced", false);
+    prefs.end();
+    everSyncedCacheLoaded = true;
+  }
+  return everSyncedCache;
+}
+
+void setEverSyncedFlag() {
+  prefs.begin("time", false);
+  prefs.putBool("synced", true);
+  prefs.end();
+  everSyncedCache = true;
+  everSyncedCacheLoaded = true;
+}
+
 bool isTimeValid() {
   if (!rtcAvailable) return false;
-  return !rtc.lostPower(); // lostPower() is true if battery was ever depleted/removed and it's never been set
+  if (rtc.lostPower()) return false; // battery was ever depleted/removed and it's never been set
+  return everSyncedFlag(); // and WE have actually set it at least once
 }
 
 time_t getCurrentEpoch() {
@@ -106,12 +140,16 @@ time_t getCurrentEpoch() {
 void setCurrentEpoch(time_t newEpoch) {
   if (!rtcAvailable) return;
   rtc.adjust(DateTime((uint32_t)newEpoch));
+  setEverSyncedFlag();
 }
 
 // ---------------- Schedule model ----------------
 // Stored as JSON array in NVS under key "schedule":
-// [{"id":1,"days":[0,1,2,3,4,5,6],"hour":7,"minute":30,"duration":300,"enabled":true}, ...]
-// days: 0=Sunday ... 6=Saturday  (matches JS Date.getDay())
+// [{"id":1,"cron":"30 7 * * 1-5","duration":300,"enabled":true}, ...]
+// "cron" is a standard 5-field cron string: minute hour dom month dow
+// (dow: 0=Sunday ... 6=Saturday, matches JS Date.getDay()). Each field
+// supports "*", "*/N", a single value, comma lists, and ranges ("a-b",
+// "a-b/N"). No seconds field, no "L"/"W"/"#".
 // NOTE: the ESP32 has no timezone concept. The web page sends a
 // timestamp constructed so that gmtime() on the device lines up with
 // your intended LOCAL wall-clock day/hour/minute. See the HTML file.
@@ -129,11 +167,48 @@ void saveScheduleJson(const String& json) {
   prefs.end();
 }
 
+// Evaluate a single cron field (comma-separated list of "*", "*/N", "a-b",
+// "a-b/N", or a literal number) against a value in [minV, maxV].
+bool cronFieldMatches(const String& field, int value, int minV, int maxV) {
+  int start = 0;
+  while (start <= (int)field.length()) {
+    int comma = field.indexOf(',', start);
+    String token = (comma == -1) ? field.substring(start) : field.substring(start, comma);
+    token.trim();
+
+    int rangeLo = minV, rangeHi = maxV, step = 1;
+    int slash = token.indexOf('/');
+    String rangePart = (slash == -1) ? token : token.substring(0, slash);
+    if (slash != -1) step = token.substring(slash + 1).toInt();
+    if (step <= 0) step = 1;
+
+    if (rangePart == "*") {
+      rangeLo = minV; rangeHi = maxV;
+    } else {
+      int dash = rangePart.indexOf('-');
+      if (dash != -1) {
+        rangeLo = rangePart.substring(0, dash).toInt();
+        rangeHi = rangePart.substring(dash + 1).toInt();
+      } else {
+        rangeLo = rangeHi = rangePart.toInt();
+      }
+    }
+
+    if (value >= rangeLo && value <= rangeHi && ((value - rangeLo) % step) == 0) return true;
+
+    if (comma == -1) break;
+    start = comma + 1;
+  }
+  return false;
+}
+
 // Find the next occurrence (epoch seconds) of ANY enabled schedule entry
-// at or after fromEpoch. Returns 0 if none found (empty/disabled schedule).
-// NOTE: deliberately avoids timegm() (not available on all ESP32 toolchains)
-// by doing the day/hour/minute math directly in epoch seconds instead of
-// via struct tm - this also sidesteps any month/day rollover edge cases.
+// at or after fromEpoch. Returns 0 if none found (empty/disabled schedule,
+// or no match within the search horizon). NOTE: deliberately avoids
+// timegm() (not available on all ESP32 toolchains) by doing the day math
+// directly in epoch seconds instead of via mktime().
+#define CRON_SEARCH_HORIZON_DAYS 366
+
 time_t computeNextEvent(const String& scheduleJson, time_t fromEpoch, JsonVariant* outEntry, DynamicJsonDocument* doc) {
   deserializeJson(*doc, scheduleJson);
   JsonArray arr = doc->as<JsonArray>();
@@ -149,30 +224,61 @@ time_t computeNextEvent(const String& scheduleJson, time_t fromEpoch, JsonVarian
 
   for (JsonVariant entry : arr) {
     if (!entry["enabled"].as<bool>()) continue;
-    int hour = entry["hour"].as<int>();
-    int minute = entry["minute"].as<int>();
-    JsonArray days = entry["days"].as<JsonArray>();
+    String cron = entry["cron"].as<String>();
 
-    for (int dayOffset = 0; dayOffset < 8; dayOffset++) {
-      time_t candidate = todayMidnight + (time_t)dayOffset * 86400L + (time_t)hour * 3600L + (time_t)minute * 60L;
+    // Split "minute hour dom month dow"
+    String fields[5];
+    int fieldIdx = 0, pos = 0;
+    while (fieldIdx < 5 && pos <= (int)cron.length()) {
+      int sp = cron.indexOf(' ', pos);
+      fields[fieldIdx++] = (sp == -1) ? cron.substring(pos) : cron.substring(pos, sp);
+      if (sp == -1) break;
+      pos = sp + 1;
+    }
+    if (fieldIdx < 5) continue; // malformed cron string, skip this entry
 
-      if (candidate < fromEpoch) continue;
+    time_t bestForEntry = 0;
 
-      struct tm normTm;
-      gmtime_r(&candidate, &normTm);
-      int wday = normTm.tm_wday; // 0=Sunday
+    for (int dayOffset = 0; dayOffset < CRON_SEARCH_HORIZON_DAYS; dayOffset++) {
+      time_t dayMidnight = todayMidnight + (time_t)dayOffset * 86400L;
 
-      bool dayMatches = false;
-      for (JsonVariant d : days) {
-        if (d.as<int>() == wday) { dayMatches = true; break; }
-      }
+      struct tm dayTm;
+      gmtime_r(&dayMidnight, &dayTm);
+      int dom = dayTm.tm_mday;       // 1-31
+      int month = dayTm.tm_mon + 1;  // 1-12
+      int wday = dayTm.tm_wday;      // 0=Sunday
+
+      if (!cronFieldMatches(fields[3], month, 1, 12)) continue;
+
+      // Standard cron quirk: if BOTH day-of-month and day-of-week are
+      // restricted (not "*"), the day matches when EITHER matches (OR).
+      // If only one (or neither) is restricted, that one must match (an
+      // unrestricted "*" field always matches, so this degrades to AND).
+      bool domRestricted = fields[2] != "*";
+      bool dowRestricted = fields[4] != "*";
+      bool domMatch = cronFieldMatches(fields[2], dom, 1, 31);
+      bool dowMatch = cronFieldMatches(fields[4], wday, 0, 6);
+      bool dayMatches = (domRestricted && dowRestricted) ? (domMatch || dowMatch) : (domMatch && dowMatch);
       if (!dayMatches) continue;
 
-      if (best == 0 || candidate < best) {
-        best = candidate;
-        bestEntry = entry;
+      // This day matches - find the earliest matching hour:minute.
+      for (int hour = 0; hour < 24; hour++) {
+        if (!cronFieldMatches(fields[1], hour, 0, 23)) continue;
+        for (int minute = 0; minute < 60; minute++) {
+          if (!cronFieldMatches(fields[0], minute, 0, 59)) continue;
+          time_t candidate = dayMidnight + (time_t)hour * 3600L + (time_t)minute * 60L;
+          if (candidate < fromEpoch) continue;
+          bestForEntry = candidate;
+          break;
+        }
+        if (bestForEntry != 0) break;
       }
-      break; // found the earliest valid day-offset for this entry, no need to check further offsets
+      if (bestForEntry != 0) break; // earliest match found for this entry
+    }
+
+    if (bestForEntry != 0 && (best == 0 || bestForEntry < best)) {
+      best = bestForEntry;
+      bestEntry = entry;
     }
   }
 
@@ -235,6 +341,7 @@ class TimeCallbacks : public NimBLECharacteristicCallbacks {
     DBG("[BLE] Time WRITE received: '%s'\n", val.c_str());
     if (val.length() > 0) {
       time_t epoch = (time_t)strtoll(val.c_str(), nullptr, 10);
+      DBG("[BLE] Time raw='%s' parsed epoch=%ld\n", val.c_str(), (long)epoch);
       if (epoch > 1700000000) { // sanity check: after ~Nov 2023
         setCurrentEpoch(epoch);
         bleActivityHappened = true;
@@ -322,7 +429,7 @@ void publishStatus() {
 // ---------------- BLE setup ----------------
 void startBLE() {
   DBG("[BLE] Initializing NimBLE...\n");
-  NimBLEDevice::init("ESP32-Switch");
+  NimBLEDevice::init("Stevezuiger 3000");
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
@@ -356,7 +463,7 @@ void startBLE() {
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->start();
-  DBG("[BLE] Advertising started as 'ESP32-Switch'\n");
+  DBG("[BLE] Advertising started as 'Stevezuiger 3000'\n");
 }
 
 void stopBLE() {
@@ -370,10 +477,12 @@ void goToSleepUntil(time_t targetEpoch, WakeReason reason) {
   int64_t sleepSec = (int64_t)targetEpoch - (int64_t)now;
   if (sleepSec < 1) sleepSec = 1;
 
-  // Hold the relay pin's current level through deep sleep if it's been
-  // manually turned ON - otherwise the pin can reset/float on wake and
+  // Hold the relay pin's current level through deep sleep whenever it's
+  // physically ON (manually turned on, or mid a scheduled pulse we're
+  // sleeping through) - otherwise the pin can reset/float on wake and
   // drop the switch unexpectedly.
-  if (relayManualOn) {
+  bool relayCurrentlyOn = digitalRead(RELAY_PIN) == (RELAY_ACTIVE_HIGH ? HIGH : LOW);
+  if (relayCurrentlyOn) {
     gpio_hold_en((gpio_num_t)RELAY_PIN);
     gpio_deep_sleep_hold_en();
   } else {
@@ -390,11 +499,21 @@ void goToSleepUntil(time_t targetEpoch, WakeReason reason) {
   esp_deep_sleep_start(); // does not return
 }
 
+// More frequent BLE connect windows during the day, less frequent at night
+// (when the pump/app is used much less). Stays on the day interval if the
+// clock isn't synced yet, so you can still reach it promptly to fix that.
+time_t currentAdvertiseIntervalSec(time_t now) {
+  if (!isTimeValid()) return ADVERTISE_INTERVAL_DAY_SEC;
+  struct tm nowTm;
+  gmtime_r(&now, &nowTm);
+  return (nowTm.tm_hour >= DAY_START_HOUR) ? ADVERTISE_INTERVAL_DAY_SEC : ADVERTISE_INTERVAL_NIGHT_SEC;
+}
+
 void planNextSleepAndGo() {
   time_t now = getCurrentEpoch();
   String schedJson = loadScheduleJson();
 
-  time_t nextAdvertise = now + ADVERTISE_INTERVAL_SEC;
+  time_t nextAdvertise = now + currentAdvertiseIntervalSec(now);
   time_t nextEvent = 0;
 
   if (isTimeValid()) {
@@ -467,8 +586,18 @@ void handleScheduledEvent() {
   if (!entry.isNull() && entry.containsKey("duration")) {
     duration = entry["duration"].as<int>();
   }
-  DBG("[EVENT] Scheduled event firing, duration=%d sec\n", duration);
-  firePulse(duration);
+  if (duration < 1) duration = 1;
+  if (duration > (int)MAX_SCHEDULED_PULSE_SECONDS) duration = (int)MAX_SCHEDULED_PULSE_SECONDS;
+  DBG("[EVENT] Scheduled event firing, duration=%d sec (sleeping through it)\n", duration);
+
+  // Unlike firePulse() (used for interactive TRIGGER/manual-ON-fallback,
+  // which need to return quickly to a live BLE connection), an unattended
+  // scheduled pulse deep-sleeps for its duration instead of blocking with
+  // delay() - the relay pin is held through sleep by goToSleepUntil(), and
+  // setup()'s unconditional relaySet(relayManualOn) on the next boot
+  // restores the correct post-pulse state.
+  relaySet(true);
+  goToSleepUntil(now + (time_t)duration, WAKE_PULSE_END); // never returns
 }
 
 // ---------------- Arduino entry points ----------------
@@ -512,7 +641,13 @@ void setup() {
 
   if (cause == ESP_SLEEP_WAKEUP_TIMER && rtcWakeReason == WAKE_EVENT) {
     DBG("[BOOT] Waking to run a SCHEDULED EVENT\n");
-    handleScheduledEvent();
+    handleScheduledEvent(); // never returns
+  } else if (cause == ESP_SLEEP_WAKEUP_TIMER && rtcWakeReason == WAKE_PULSE_END) {
+    // A scheduled pulse's sleep just ended - the relay was already
+    // restored to relayManualOn's state by the unconditional relaySet()
+    // above. Nothing else to do; fall through to plan the next sleep
+    // (deliberately not opening a BLE window here).
+    DBG("[BOOT] Scheduled pulse finished\n");
   } else if (cause == ESP_SLEEP_WAKEUP_TIMER && rtcWakeReason == WAKE_AUTO_OFF) {
     // Safety cutoff: manual ON has run for the maximum allowed time.
     // Shut it off unconditionally, no BLE window needed for this - it's

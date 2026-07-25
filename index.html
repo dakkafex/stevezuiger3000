@@ -52,10 +52,11 @@
   }
   .day-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
   label { font-size: 0.8rem; color: var(--muted); display: block; margin-bottom: 4px; }
-  input[type="time"], input[type="number"] {
+  input[type="time"], input[type="number"], input[type="text"] {
     background: #0d0f14; border: 1px solid var(--border); color: var(--text);
     border-radius: 6px; padding: 8px; width: 100%; font-size: 0.9rem;
   }
+  input.invalid { border-color: var(--danger); }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .muted { color: var(--muted); font-size: 0.8rem; }
   .toast {
@@ -68,7 +69,7 @@
 <body>
 
 <h1>Steve's druip reinigs services</h1>
-<div class="subtitle">Slurpt de lekbak leeg.</div>
+<div class="subtitle">Slurpt de lekbak leeg. <span class="muted">v1.0</span></div>
 
 <div class="panel row">
   <div><span id="statusDot" class="status-dot"></span><span id="statusText">Not connected</span></div>
@@ -88,7 +89,7 @@
   <div class="grid" style="margin-top:10px;">
     <div>
       <label>Run for (minutes)</label>
-      <input type="number" id="runMinutes" min="1" value="20">
+      <input type="number" id="runMinutes" min="1" max="3" value="3">
     </div>
     <div style="display:flex; align-items:flex-end; gap:8px;">
       <button id="onBtn" disabled style="flex:1;">Turn ON</button>
@@ -133,10 +134,25 @@ const TIME_UUID      = "12345678-1234-1234-1234-123456789ab2";
 const STATUS_UUID    = "12345678-1234-1234-1234-123456789ab3";
 const COMMAND_UUID   = "12345678-1234-1234-1234-123456789ab4";
 
-const DAY_LABELS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-
 let device, server, scheduleChar, timeChar, statusChar, commandChar;
 let entries = []; // { id, days:[], hour, minute, duration, enabled }
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// Standard 5-field cron: minute hour dom month dow, each "*", "*/N",
+// "a", "a-b", "a-b/N", or a comma list of those.
+const CRON_FIELD_RE = /^(\*|\d+)(-\d+)?(\/\d+)?$/;
+function isValidCronField(field) {
+  return field.length > 0 && field.split(',').every(tok => CRON_FIELD_RE.test(tok));
+}
+function isValidCron(cron) {
+  const fields = cron.trim().split(/\s+/);
+  return fields.length === 5 && fields.every(isValidCronField);
+}
 
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -250,8 +266,13 @@ function onStatusUpdate(event) {
 async function syncTime() {
   const epoch = localWallClockAsEpoch();
   const enc = new TextEncoder().encode(String(epoch));
-  await timeChar.writeValue(enc);
-  toast('Time synced');
+  try {
+    await timeChar.writeValueWithResponse(enc);
+    toast('Time synced');
+  } catch (err) {
+    console.error(err);
+    toast('Time sync failed: ' + err.message);
+  }
 }
 
 async function triggerNow() {
@@ -261,7 +282,7 @@ async function triggerNow() {
 }
 
 async function turnOn() {
-  const minutes = parseInt(document.getElementById('runMinutes').value, 10) || 20;
+  const minutes = parseInt(document.getElementById('runMinutes').value, 10) || 3;
   const seconds = minutes * 60;
   const enc = new TextEncoder().encode('ON:' + seconds);
   await commandChar.writeValue(enc);
@@ -277,6 +298,12 @@ async function turnOff() {
 }
 
 async function saveSchedule() {
+  const invalid = entries.filter(e => !isValidCron(e.cron));
+  if (invalid.length > 0) {
+    toast('Fix invalid cron expression(s) before saving');
+    renderEntries();
+    return;
+  }
   const json = JSON.stringify(entries);
   if (json.length > 4000) {
     toast('Schedule too large - remove some entries');
@@ -290,9 +317,7 @@ async function saveSchedule() {
 function addEntry() {
   entries.push({
     id: Date.now(),
-    days: [1,2,3,4,5], // Mon-Fri default
-    hour: 7,
-    minute: 30,
+    cron: "0 7 * * *", // every day at 07:00
     duration: 300,
     enabled: true
   });
@@ -301,13 +326,6 @@ function addEntry() {
 
 function removeEntry(id) {
   entries = entries.filter(e => e.id !== id);
-  renderEntries();
-}
-
-function toggleDay(entry, dayIndex) {
-  const idx = entry.days.indexOf(dayIndex);
-  if (idx >= 0) entry.days.splice(idx, 1);
-  else entry.days.push(dayIndex);
   renderEntries();
 }
 
@@ -324,8 +342,6 @@ function renderEntries() {
     const div = document.createElement('div');
     div.className = 'entry';
 
-    const timeStr = String(entry.hour).padStart(2,'0') + ':' + String(entry.minute).padStart(2,'0');
-
     div.innerHTML = `
       <div class="row">
         <label style="margin:0;">
@@ -333,11 +349,11 @@ function renderEntries() {
         </label>
         <button class="danger" data-role="remove" style="padding:4px 10px;">Remove</button>
       </div>
-      <div class="days" data-role="days"></div>
-      <div class="grid">
+      <div class="grid" style="margin-top:8px;">
         <div>
-          <label>Time</label>
-          <input type="time" value="${timeStr}" data-role="time">
+          <label>Cron (min hour dom month dow)</label>
+          <input type="text" value="${escapeHtml(entry.cron)}" placeholder="30 7 * * 1-5" data-role="cron"
+                 class="${isValidCron(entry.cron) ? '' : 'invalid'}">
         </div>
         <div>
           <label>Duration (seconds)</label>
@@ -346,23 +362,13 @@ function renderEntries() {
       </div>
     `;
 
-    const daysContainer = div.querySelector('[data-role="days"]');
-    DAY_LABELS.forEach((label, i) => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'day-btn' + (entry.days.includes(i) ? ' active' : '');
-      btn.textContent = label;
-      btn.onclick = () => toggleDay(entry, i);
-      daysContainer.appendChild(btn);
-    });
-
     div.querySelector('[data-role="enabled"]').onchange = (e) => {
       entry.enabled = e.target.checked;
     };
     div.querySelector('[data-role="remove"]').onclick = () => removeEntry(entry.id);
-    div.querySelector('[data-role="time"]').onchange = (e) => {
-      const [h, m] = e.target.value.split(':').map(Number);
-      entry.hour = h; entry.minute = m;
+    div.querySelector('[data-role="cron"]').onchange = (e) => {
+      entry.cron = e.target.value.trim();
+      renderEntries();
     };
     div.querySelector('[data-role="duration"]').onchange = (e) => {
       entry.duration = parseInt(e.target.value, 10) || 1;
